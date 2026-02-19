@@ -60,7 +60,6 @@
             flex-shrink: 0; /* Evitar que el mapa aplaste el panel */
         }
     </style>
-<link rel="stylesheet" href="/index.css">
 </head>
 <body class="h-screen flex flex-col overflow-hidden bg-[#565859] text-[#eeeeee]">
 
@@ -130,6 +129,7 @@
                             <label class="block text-xs font-semibold text-gray-300 mb-1">Datum / CRS Origen</label>
                             <select id="datumSelect" class="w-full text-sm bg-gray-700 text-[#eeeeee] border-gray-600 rounded shadow-sm focus:border-[#E7C10B] focus:ring-[#E7C10B] p-1.5 border">
                                 <option value="WGS84">WGS84 (Global - EPSG:4326)</option>
+                                <option value="EPSG:3857">Web Mercator (Google/Bing - EPSG:3857)</option>
                                 <option value="SIRGAS">SIRGAS 2000 (Latinoamérica)</option>
                                 <option value="REGVEN">REGVEN (Venezuela)</option>
                                 <option value="PSAD56">PSAD56 (Sudamérica)</option>
@@ -273,7 +273,8 @@
         const state = {
             rawData: [],
             headers: [],
-            features: [],
+            features: [], // WGS84 para visualización y base de exportación
+            loadedFeatures: [], // Copia de features originales cargadas (para reproyección desde fuente)
             map: null,
             layerGroup: null,
             isSpatial: false, // Flag para identificar GeoJSON/ArcGIS
@@ -376,6 +377,7 @@
             state.rawData = [];
             state.headers = [];
             state.features = [];
+            state.loadedFeatures = [];
             state.isSpatial = false;
             state.sourceProj = 'EPSG:4326';
             state.sourceProjName = 'WGS84';
@@ -397,6 +399,8 @@
 
             document.getElementById('selectX').innerHTML = '';
             document.getElementById('selectY').innerHTML = '';
+            document.getElementById('selectX').disabled = false;
+            document.getElementById('selectY').disabled = false;
 
             const geoRadio = document.querySelector('input[name="coordType"][value="geo"]');
             if(geoRadio) geoRadio.checked = true;
@@ -409,6 +413,7 @@
             document.getElementById('geometryType').value = 'Point';
             document.getElementById('geometryHelp').innerText = "Dibuja un marcador por cada fila.";
             document.getElementById('spatialMsg').classList.add('hidden');
+            document.getElementById('step3').classList.remove('opacity-50');
 
             log("Sesión reiniciada. Puedes cargar un nuevo archivo.", "success");
         }
@@ -504,19 +509,49 @@
 
         function parseJSON(text) {
             try {
-                const json = JSON.parse(text);
+                let json = null;
+                // Intento robusto de parseo (para listas de features sueltas)
+                try {
+                    json = JSON.parse(text);
+                } catch(e) {
+                    // Si falla, intenta envolver en array si parece una lista separada por comas
+                    try {
+                        json = JSON.parse(`[${text}]`);
+                    } catch(e2) {
+                        throw new Error("JSON inválido o mal formado.");
+                    }
+                }
+
                 let features = [];
                 let headers = [];
                 let type = "GeoJSON";
+                let detectedCrs = null;
 
-                if (json.type === 'FeatureCollection' && json.features) {
+                if (Array.isArray(json)) {
+                    // Si es un array directo de features
+                    features = json;
+                    type = "Lista de Features";
+                } 
+                else if (json.type === 'FeatureCollection' && json.features) {
                     features = json.features;
-                } else if (json.type === 'Feature') {
+                    if(json.crs) detectedCrs = json.crs;
+                } 
+                else if (json.type === 'Feature') {
                     features = [json];
                 }
                 else if (json.features && (json.geometryType || json.spatialReference)) {
                     type = "ArcGIS JSON";
                     log(`Formato ArcGIS detectado. GeometryType: ${json.geometryType}`, 'info');
+
+                    if (json.spatialReference && json.spatialReference.wkid) {
+                         // Auto-detectar WGS84 o WebMercator
+                         if (json.spatialReference.wkid === 3857 || json.spatialReference.wkid === 102100) {
+                             document.getElementById('datumSelect').value = 'EPSG:3857';
+                             log("Proyección detectada: Web Mercator (EPSG:3857)", 'success');
+                         } else if (json.spatialReference.wkid === 4326) {
+                             document.getElementById('datumSelect').value = 'WGS84';
+                         }
+                    }
 
                     features = json.features.map(f => {
                         let geom = null;
@@ -533,8 +568,12 @@
 
                 if (features.length > 0) {
                     state.features = features;
+                    state.loadedFeatures = JSON.parse(JSON.stringify(features)); // Guardar copia original
                     headers = Object.keys(features[0].properties || {});
                     const tableData = features.map(f => f.properties);
+
+                    // [NEW] Call the auto-detection
+                    autoDetectAndSetSpatialCRS(json, features);
 
                     onDataLoaded(tableData, headers, true);
                     log(`${type} cargado: ${features.length} elementos.`, 'success');
@@ -568,9 +607,20 @@
             if (isSpatialSource) {
                 document.getElementById('spatialMsg').classList.remove('hidden');
                 document.getElementById('geometryType').value = 'Auto';
+                
+                // Configurar UI para evitar el paso 3 que es innecesario
+                selX.innerHTML = '<option>Geometría Interna del Archivo</option>';
+                selY.innerHTML = '<option>Geometría Interna del Archivo</option>';
+                selX.disabled = true;
+                selY.disabled = true;
+                document.getElementById('step3').classList.add('opacity-50');
+
             } else {
                 document.getElementById('spatialMsg').classList.add('hidden');
                 document.getElementById('geometryType').value = 'Point';
+                selX.disabled = false;
+                selY.disabled = false;
+                document.getElementById('step3').classList.remove('opacity-50');
             }
             updateGeometryHelp();
 
@@ -609,18 +659,76 @@
         proj4.defs("PSAD56", "+proj=longlat +ellps=intl +towgs84=-288,175,-376,0,0,0,0 +no_defs");
         proj4.defs("REGVEN", "+proj=longlat +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +no_defs");
         proj4.defs("SIRGAS", "+proj=longlat +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +no_defs");
+        proj4.defs("EPSG:3857", "+proj=merc +a=6378137 +b=6378137 +lat_ts=0.0 +lon_0=0.0 +x_0=0.0 +y_0=0 +k=1.0 +units=m +nadgrids=@null +wktext  +no_defs");
 
         function processData() {
             const btn = document.getElementById('btnProcess');
             const geomType = document.getElementById('geometryType').value;
 
-            if (state.isSpatial && state.features.length > 0 && geomType === 'Auto') {
-                log('Dibujando datos espaciales nativos...', 'info');
+            // Lógica Especial para Archivos Espaciales (GeoJSON/ArcGIS)
+            if (state.isSpatial && state.loadedFeatures.length > 0 && geomType === 'Auto') {
+                log('Procesando archivo espacial nativo...', 'info');
+
+                // 1. Determinar proyección de entrada seleccionada en Step 2
+                const coordType = document.querySelector('input[name="coordType"]:checked').value;
+                const datum = document.getElementById('datumSelect').value;
+                let inputProj = 'EPSG:4326';
+                let inputWkid = 4326;
+                let inputProjName = 'WGS84';
+
+                if (coordType === 'utm') {
+                    const zone = parseInt(document.getElementById('utmZone').value, 10);
+                    const hemi = document.getElementById('utmHemi').value;
+                    let datumParam = "+datum=WGS84";
+                    inputWkid = 32600 + zone; 
+                    if (hemi === 'S') inputWkid = 32700 + zone;
+                    // Ajustes de datum UTM...
+                    if (datum === 'PSAD56') { datumParam = "+ellps=intl +towgs84=-288,175,-376,0,0,0,0"; inputWkid = 0; }
+                    if (datum === 'REGVEN') { datumParam = "+ellps=GRS80 +towgs84=0,0,0,0,0,0,0"; inputWkid = 0; }
+                    if (datum === 'SIRGAS') { datumParam = "+ellps=GRS80 +towgs84=0,0,0,0,0,0,0"; inputWkid = 0; }
+                    inputProj = `+proj=utm +zone=${zone} ${hemi === 'S' ? '+south ' : ''} ${datumParam} +units=m +no_defs`;
+                    inputProjName = `UTM Z${zone}${hemi} (${datum})`;
+                } else {
+                    inputProj = datum === 'WGS84' ? 'EPSG:4326' : datum;
+                    inputProjName = datum;
+                    if (datum === 'SIRGAS') inputWkid = 4674;
+                    if (datum === 'REGVEN') inputWkid = 4189;
+                    if (datum === 'PSAD56') inputWkid = 4248;
+                    if (datum === 'EPSG:3857') inputWkid = 3857;
+                }
+
+                // Guardar Source Proj para poder Exportar de vuelta al formato original
+                state.sourceProj = inputProj;
+                state.sourceProjName = inputProjName;
+                state.sourceWkid = inputWkid;
+
+                // 2. Reproyectar Features de INPUT -> WGS84 para visualización
+                // Usamos loadedFeatures como fuente original para evitar doble reproyección si el usuario pulsa procesar varias veces
+                let featuresToDraw = JSON.parse(JSON.stringify(state.loadedFeatures));
+
+                if (inputProj !== 'EPSG:4326') {
+                    log(`Reproyectando geometría de ${inputProjName} a WGS84...`, 'info');
+                    try {
+                        featuresToDraw = featuresToDraw.map(f => {
+                             if (!f.geometry) return f;
+                             const newGeom = transformGeometry(f.geometry, inputProj, 'EPSG:4326');
+                             return { ...f, geometry: newGeom };
+                        });
+                    } catch(e) {
+                        log("Error reproyectando: " + e.message, "error");
+                    }
+                } else {
+                    log("Proyección de entrada WGS84, no se requiere transformación.", 'info');
+                }
+
+                state.features = featuresToDraw; // Estado listo para el Mapa (siempre WGS84)
+
                 drawMapFeatures();
                 enableSection('step5');
                 return;
             }
 
+            // ... Lógica estándar para CSV/Excel ...
             if(state.rawData.length === 0) {
                 log('No hay datos cargados.', 'error');
                 return;
@@ -685,6 +793,7 @@
                 if (datum === 'SIRGAS') sourceWkid = 4674;
                 if (datum === 'REGVEN') sourceWkid = 4189;
                 if (datum === 'PSAD56') sourceWkid = 4248;
+                if (datum === 'EPSG:3857') sourceWkid = 3857;
             }
 
             // Guardar en estado global para exportación
@@ -702,7 +811,8 @@
                 if (!isNaN(x) && !isNaN(y)) {
                     if(coordType === 'utm') {
                          if(x < 100000 || x > 900000 || y < 0 || y > 10000000) outOfBoundsCount++;
-                    } else {
+                    } else if (datum !== 'EPSG:3857') {
+                         // Simple check for lat/lon limits if NOT Web Mercator
                          if(x < -180 || x > 180 || y < -90 || y > 90) outOfBoundsCount++;
                     }
 
@@ -944,7 +1054,153 @@
             download(kml, getFileName('.kml'), 'application/vnd.google-earth.kml+xml');
             log('KML generado y descargado correctamente.', 'success');
         }
+
+        // ===============================
+        // [NEW] Auto-CRS para GeoJSON/JSON espacial
+        // ===============================
+
+        // Extrae EPSG numérico desde:
+        // - "EPSG:3857"
+        // - "urn:ogc:def:crs:EPSG::3857"
+        // - "http://www.opengis.net/def/crs/EPSG/0/3857"
+        function _extractEpsgFromCrs(crsObj) {
+            if (!crsObj) return null;
+            const name = crsObj?.properties?.name || crsObj?.name || "";
+            if (!name) return null;
+
+            const s = String(name);
+            let m = s.match(/EPSG(?::|::|\/0\/)(\d{4,6})/i);
+            if (m) return parseInt(m[1], 10);
+
+            // fallback: si solo viene el número en algún lado
+            m = s.match(/(\d{4,6})/);
+            return m ? parseInt(m[1], 10) : null;
+        }
+
+        // Toma una muestra de coordenadas y trata de adivinar si parecen EPSG:3857
+        // (muy típico cuando el GeoJSON no trae crs)
+        function _guessEpsgFromCoords(features) {
+            try {
+                const maxCheck = Math.min(features.length, 80);
+                let maxAbs = 0;
+
+                const scanCoord = (c) => {
+                if (!Array.isArray(c) || c.length < 2) return;
+                const x = Math.abs(Number(c[0]));
+                const y = Math.abs(Number(c[1]));
+                if (Number.isFinite(x)) maxAbs = Math.max(maxAbs, x);
+                if (Number.isFinite(y)) maxAbs = Math.max(maxAbs, y);
+                };
+
+                for (let i = 0; i < maxCheck; i++) {
+                    const g = features[i]?.geometry;
+                    if (!g) continue;
+
+                    if (g.type === "Point") scanCoord(g.coordinates);
+                    else if (g.type === "LineString") g.coordinates?.slice(0, 10)?.forEach(scanCoord);
+                    else if (g.type === "Polygon") g.coordinates?.[0]?.slice(0, 10)?.forEach(scanCoord);
+                    else if (g.type === "MultiPoint") g.coordinates?.slice(0, 10)?.forEach(scanCoord);
+                    else if (g.type === "MultiLineString") g.coordinates?.[0]?.slice(0, 10)?.forEach(scanCoord);
+                    else if (g.type === "MultiPolygon") g.coordinates?.[0]?.[0]?.slice(0, 10)?.forEach(scanCoord);
+                }
+
+                // Heurística:
+                // Si hay valores muy por encima de 180/90 pero dentro del rango típico de WebMercator (~20,037,508)
+                if (maxAbs > 1000 && maxAbs < 25000000) return 3857;
+
+                return null;
+            } catch {
+                return null;
+            }
+        }
+
+        // Aplica CRS detectado a tu UI del Paso 2 (datumSelect + UTM si aplica)
+        function _applyDetectedCrsToUI(wkid) {
+            const datumSelect = document.getElementById("datumSelect");
+            const utmZone = document.getElementById("utmZone");
+            const utmHemi = document.getElementById("utmHemi");
+
+            const setCoordType = (type) => {
+                const r = document.querySelector(`input[name="coordType"][value="${type}"]`);
+                if (r) r.checked = true;
+                updateUIForCoordType();
+            };
+
+            // Mapear WKID conocidos a tu combo actual
+            if (wkid === 4326) {
+                setCoordType("geo");
+                datumSelect.value = "WGS84";
+                return true;
+            }
+            if (wkid === 3857 || wkid === 102100) {
+                setCoordType("geo");
+                datumSelect.value = "EPSG:3857";
+                return true;
+            }
+            if (wkid === 4674) { // SIRGAS 2000
+                setCoordType("geo");
+                datumSelect.value = "SIRGAS";
+                return true;
+            }
+            if (wkid === 4189) { // REGVEN
+                setCoordType("geo");
+                datumSelect.value = "REGVEN";
+                return true;
+            }
+            if (wkid === 4248) { // PSAD56
+                setCoordType("geo");
+                datumSelect.value = "PSAD56";
+                return true;
+            }
+
+            // Soporte UTM WGS84 estándar: EPSG:326xx (N) / EPSG:327xx (S)
+            if (wkid >= 32601 && wkid <= 32660) {
+                const z = wkid - 32600;
+                setCoordType("utm");
+                datumSelect.value = "WGS84";
+                utmZone.value = z;
+                utmHemi.value = "N";
+                updateUIForCoordType();
+                return true;
+            }
+            if (wkid >= 32701 && wkid <= 32760) {
+                const z = wkid - 32700;
+                setCoordType("utm");
+                datumSelect.value = "WGS84";
+                utmZone.value = z;
+                utmHemi.value = "S";
+                updateUIForCoordType();
+                return true;
+            }
+
+            return false; // CRS detectado pero no soportado por tu UI actual
+        }
+
+        // Función principal: detectar CRS de entrada y preconfigurar Paso 2 automáticamente
+        function autoDetectAndSetSpatialCRS(rawJson, features) {
+            // 1) Intentar desde rawJson.crs (GeoJSON)
+            let wkid = _extractEpsgFromCrs(rawJson?.crs);
+
+            // 2) Intentar desde rawJson.spatialReference (algunos JSON lo traen)
+            if (!wkid && rawJson?.spatialReference?.wkid) wkid = Number(rawJson.spatialReference.wkid);
+
+            // 3) Heurística por coordenadas (cuando no hay crs)
+            if (!wkid) wkid = _guessEpsgFromCoords(features);
+
+            if (!wkid) {
+                log("Auto-CRS: no se pudo detectar CRS. Confirma el Paso 2 antes de procesar.", "warn");
+                return;
+            }
+
+            const applied = _applyDetectedCrsToUI(wkid);
+
+            if (applied) {
+                state._autoDetectedWkid = wkid; // (propiedad nueva opcional)
+                log(`Auto-CRS: detectado EPSG:${wkid}. Paso 2 preconfigurado automáticamente.`, "success");
+            } else {
+                log(`Auto-CRS: detectado EPSG:${wkid}, pero no está soportado en tu lista. Selecciona CRS manualmente.`, "warn");
+            }
+        }
     </script>
-<script type="module" src="/index.tsx"></script>
 </body>
 </html>
